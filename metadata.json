@@ -1,0 +1,6 @@
+{
+  "name": "Secure Card Verifier & Authenticator",
+  "description": "Verifies credit card authenticity and funds availability using real-time end-to-end encryption and server-side smart AI simulation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
