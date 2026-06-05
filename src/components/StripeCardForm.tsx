@@ -14,6 +14,9 @@ import {
   ArrowRight,
   Cpu,
   Zap,
+  DollarSign,
+  FileText,
+  Mail,
 } from 'lucide-react';
 
 // Stripe Elements styling to match the VerifyCORE dark theme
@@ -45,6 +48,8 @@ const ELEMENT_OPTIONS = {
 
 interface StripeCardFormProps {
   onTokenized: (paymentMethodId: string) => void;
+  onChargeTokenized?: (paymentMethodId: string, amount: number, description: string, receiptEmail: string) => void;
+  chargeMode?: boolean;
   onError: (error: string) => void;
   isLoading: boolean;
   setIsLoading: (loading: boolean) => void;
@@ -57,6 +62,8 @@ interface StripeCardFormProps {
 
 export default function StripeCardForm({
   onTokenized,
+  onChargeTokenized,
+  chargeMode = false,
   onError,
   isLoading,
   setIsLoading,
@@ -68,6 +75,10 @@ export default function StripeCardForm({
 }: StripeCardFormProps) {
   const stripe = useStripe();
   const elements = useElements();
+
+  const [chargeAmount, setChargeAmount] = useState<string>('5.00');
+  const [chargeDescription, setChargeDescription] = useState<string>('');
+  const [receiptEmail, setReceiptEmail] = useState<string>('');
 
   const [cardComplete, setCardComplete] = useState({
     cardNumber: false,
@@ -81,11 +92,15 @@ export default function StripeCardForm({
     cardCvc?: string;
   }>({});
 
+  const parsedAmount = parseFloat(chargeAmount);
+  const isAmountValid = !chargeMode || (!isNaN(parsedAmount) && parsedAmount >= 0.50);
+
   const allFieldsComplete =
     cardComplete.cardNumber &&
     cardComplete.cardExpiry &&
     cardComplete.cardCvc &&
-    cardholderName.trim().length > 0;
+    cardholderName.trim().length > 0 &&
+    isAmountValid;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -101,20 +116,23 @@ export default function StripeCardForm({
     }
 
     setIsLoading(true);
-    addLog('🔒 Initiating PCI-DSS Stripe Tokenization Flow...');
+    addLog(chargeMode ? '💰 Initiating PCI-DSS Stripe Payment Flow...' : '🔒 Initiating PCI-DSS Stripe Tokenization Flow...');
 
     try {
       addLog('📡 Exchanging card data for single-use PaymentMethod token via Stripe.js...');
 
+      const cardNumberElement = elements.getElement(CardNumberElement);
+      if (!cardNumberElement) {
+        throw new Error('CardNumberElement not found. Please reload and try again.');
+      }
+
       const { error, paymentMethod } = await stripe.createPaymentMethod({
-        elements,
-        params: {
-          type: 'card',
-          billing_details: {
-            name: cardholderName.toUpperCase().trim(),
-            address: {
-              postal_code: billingZip.trim() || undefined,
-            },
+        type: 'card',
+        card: cardNumberElement as any,
+        billing_details: {
+          name: cardholderName.toUpperCase().trim(),
+          address: {
+            postal_code: billingZip.trim() || undefined,
           },
         },
       });
@@ -133,7 +151,12 @@ export default function StripeCardForm({
         addLog(
           `🔐 Raw card data NEVER touched your server — PCI-DSS Level 1 compliant.`
         );
-        onTokenized(paymentMethod.id);
+        if (chargeMode && onChargeTokenized) {
+          addLog(`💳 Routing to payment capture for $${parsedAmount.toFixed(2)}...`);
+          onChargeTokenized(paymentMethod.id, parsedAmount, chargeDescription, receiptEmail);
+        } else {
+          onTokenized(paymentMethod.id);
+        }
       }
     } catch (err: any) {
       addLog(`❌ Tokenization Error: ${err.message}`);
@@ -261,6 +284,73 @@ export default function StripeCardForm({
           </div>
         </div>
 
+        {/* Charge Mode: Amount & Description Fields */}
+        {chargeMode && (
+          <div className="space-y-4 border-t border-slate-800 pt-4">
+            <div className="bg-amber-950/20 border border-amber-500/20 p-3 flex items-start gap-3">
+              <DollarSign className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
+              <div className="text-[10px] text-amber-300 leading-relaxed">
+                <span className="font-bold text-amber-200 block mb-0.5">Payment Capture Mode</span>
+                This will charge the card for the specified amount. The card is verified and screened for fraud before any charge is processed.
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <label className="text-[10px] uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
+                  <DollarSign className="w-3.5 h-3.5 text-amber-500" /> Charge Amount (USD)
+                </label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-mono text-base">$</span>
+                  <input
+                    id="stripe-charge-amount"
+                    type="number"
+                    step="0.01"
+                    min="0.50"
+                    max="999999.99"
+                    value={chargeAmount}
+                    onChange={(e) => setChargeAmount(e.target.value)}
+                    placeholder="5.00"
+                    className="w-full bg-slate-900 border border-slate-700/80 pl-8 pr-3 py-3 font-mono text-base tracking-wide text-white focus:outline-none focus:border-amber-500"
+                    required
+                  />
+                </div>
+                {!isAmountValid && chargeAmount.length > 0 && (
+                  <p className="text-[10px] text-red-400 font-mono">Minimum charge amount is $0.50</p>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-[10px] uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
+                  <Mail className="w-3.5 h-3.5 text-amber-500" /> Receipt Email (optional)
+                </label>
+                <input
+                  id="stripe-receipt-email"
+                  type="email"
+                  value={receiptEmail}
+                  onChange={(e) => setReceiptEmail(e.target.value)}
+                  placeholder="customer@example.com"
+                  className="w-full bg-slate-900 border border-slate-700/80 p-3 text-base tracking-wide text-white focus:outline-none focus:border-amber-500"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-[10px] uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
+                <FileText className="w-3.5 h-3.5 text-amber-500" /> Payment Description / Memo
+              </label>
+              <input
+                id="stripe-charge-description"
+                type="text"
+                value={chargeDescription}
+                onChange={(e) => setChargeDescription(e.target.value)}
+                placeholder="e.g. Order #1234, Service payment, etc."
+                className="w-full bg-slate-900 border border-slate-700/80 p-3 text-base tracking-wide text-white focus:outline-none focus:border-amber-500"
+              />
+            </div>
+          </div>
+        )}
+
         {/* Stripe test cards info */}
         <div className="border-t border-slate-800 pt-3">
           <details className="group">
@@ -297,22 +387,28 @@ export default function StripeCardForm({
         id="stripe-submit-btn"
         type="submit"
         disabled={isLoading || !stripe || !allFieldsComplete}
-        className="w-full bg-violet-600 hover:bg-violet-500 text-white font-bold py-4 px-6 rounded-none transition-all flex items-center justify-between group shadow-lg shadow-violet-950/20 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed"
+        className={`w-full font-bold py-4 px-6 rounded-none transition-all flex items-center justify-between group shadow-lg disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed ${
+          chargeMode
+            ? 'bg-amber-600 hover:bg-amber-500 text-white shadow-amber-950/20'
+            : 'bg-violet-600 hover:bg-violet-500 text-white shadow-violet-950/20'
+        }`}
       >
         <div className="flex items-center gap-3">
           {isLoading ? (
-            <RefreshCw className="w-5 h-5 animate-spin text-violet-400" />
+            <RefreshCw className={`w-5 h-5 animate-spin ${chargeMode ? 'text-amber-400' : 'text-violet-400'}`} />
+          ) : chargeMode ? (
+            <DollarSign className="w-5 h-5 text-white animate-pulse" />
           ) : (
             <Cpu className="w-5 h-5 text-white animate-pulse" />
           )}
           <span className="uppercase tracking-widest text-sm text-left">
             {isLoading
-              ? 'Processing Stripe Verification...'
-              : 'Tokenize & Verify via Stripe Gateway'}
+              ? (chargeMode ? `Processing $${parsedAmount.toFixed(2)} Payment...` : 'Processing Stripe Verification...')
+              : (chargeMode ? `Charge $${isAmountValid ? parsedAmount.toFixed(2) : '0.00'} via Stripe` : 'Tokenize & Verify via Stripe Gateway')}
           </span>
         </div>
         <div className="flex items-center gap-1.5 font-mono text-xs text-white/80 group-hover:translate-x-1 transition-transform">
-          <span>PCI-DSS</span> <ArrowRight className="w-4 h-4" />
+          <span>{chargeMode ? 'CAPTURE' : 'PCI-DSS'}</span> <ArrowRight className="w-4 h-4" />
         </div>
       </button>
     </form>

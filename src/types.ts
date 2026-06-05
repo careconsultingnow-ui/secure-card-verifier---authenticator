@@ -122,3 +122,34 @@ export interface StripeVerificationResult {
     flags: string[];
   };
 }
+
+// ---------------------------------------------------------------------------
+// Payment Processing Types
+// ---------------------------------------------------------------------------
+
+export interface PaymentResult {
+  chargeId: string;            // Stripe PaymentIntent ID
+  amount: number;              // Amount in dollars (e.g. 5.00)
+  currency: string;            // 'usd'
+  status: 'succeeded' | 'declined' | 'requires_action' | 'refunded' | 'partially_refunded';
+  receiptUrl: string | null;   // Stripe receipt URL
+  description: string;
+  cardBrand: string;
+  last4: string;
+  createdAt: string;           // ISO timestamp
+}
+
+export interface TransactionRecord extends PaymentResult {
+  cardholderName: string;
+  billingZip: string;
+  receiptEmail?: string;
+  refundedAt?: string;
+  refundId?: string;
+  refundAmount?: number;
+  riskScore: number;
+  verificationPassed: boolean;
+}
+
+export interface StripeChargeResult extends StripeVerificationResult {
+  payment: PaymentResult;
+}

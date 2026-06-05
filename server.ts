@@ -5,7 +5,7 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import Stripe from "stripe";
-import { AuthenticityReport, VerificationResult, StripeVerificationResult, AVSChecks, PreAuthResult, StripeBinData } from "./src/types";
+import { AuthenticityReport, VerificationResult, StripeVerificationResult, AVSChecks, PreAuthResult, StripeBinData, PaymentResult, TransactionRecord, StripeChargeResult } from "./src/types";
 import { generateIdempotencyKey, idempotencyStore } from "./src/utils/idempotency";
 
 dotenv.config();
@@ -119,6 +119,25 @@ function checkRateLimit(ip: string): boolean {
 
   entry.count++;
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// In-memory transaction store (FIFO, max 100 records)
+// ---------------------------------------------------------------------------
+const MAX_TRANSACTIONS = 100;
+const transactionStore: Map<string, TransactionRecord> = new Map();
+
+function addTransaction(record: TransactionRecord): void {
+  transactionStore.set(record.chargeId, record);
+  // FIFO eviction
+  if (transactionStore.size > MAX_TRANSACTIONS) {
+    const oldestKey = transactionStore.keys().next().value;
+    if (oldestKey) transactionStore.delete(oldestKey);
+  }
+}
+
+function getTransactions(limit: number = 50): TransactionRecord[] {
+  return Array.from(transactionStore.values()).reverse().slice(0, limit);
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +714,396 @@ app.post("/api/verify-stripe", async (req, res) => {
       error: err.message || "An error occurred during Stripe verification routing.",
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// PAYMENT PROCESSING: Charge a card (verify-first, then capture)
+// ---------------------------------------------------------------------------
+app.post("/api/charge-payment", async (req, res) => {
+  try {
+    if (!stripeClient) {
+      return res.status(503).json({
+        error: "Stripe is not configured. Add STRIPE_SECRET_KEY to your .env file.",
+      });
+    }
+
+    const { paymentMethodId, amount, currency, description, cardholderName, billingZip, receiptEmail } = req.body;
+
+    if (!paymentMethodId) {
+      return res.status(400).json({ error: "Missing paymentMethodId token." });
+    }
+    if (!amount || amount < 0.50) {
+      return res.status(400).json({ error: "Amount must be at least $0.50." });
+    }
+    if (amount > 999999.99) {
+      return res.status(400).json({ error: "Amount exceeds maximum allowed." });
+    }
+
+    // Rate limit check
+    const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+    if (!checkRateLimit(clientIp)) {
+      return res.status(429).json({
+        error: "Rate limit exceeded. Maximum 30 requests per minute.",
+      });
+    }
+
+    // ----- STEP 1: Retrieve PaymentMethod for BIN lookup -----
+    let paymentMethod: Stripe.PaymentMethod;
+    try {
+      paymentMethod = await stripeClient.paymentMethods.retrieve(paymentMethodId);
+    } catch (pmErr: any) {
+      return res.status(400).json({
+        error: `Failed to retrieve PaymentMethod: ${pmErr.message}`,
+      });
+    }
+
+    const card = paymentMethod.card;
+    if (!card) {
+      return res.status(400).json({ error: "PaymentMethod does not contain card data." });
+    }
+
+    const stripeBinData: StripeBinData = {
+      brand: card.brand || "unknown",
+      last4: card.last4 || "0000",
+      expMonth: card.exp_month,
+      expYear: card.exp_year,
+      funding: card.funding || "unknown",
+      country: card.country || "US",
+    };
+
+    // Check expiry
+    const now = new Date();
+    const cardExpiry = new Date(card.exp_year, card.exp_month - 1, 28);
+    const isExpired = cardExpiry < now;
+
+    const flags: string[] = [];
+    if (card.funding === "prepaid") flags.push("PREPAID_CARD_DETECTED");
+    if (isExpired) flags.push("CARD_EXPIRED");
+
+    const binMeta = mapStripeBrandToMetadata(stripeBinData.brand, stripeBinData.funding, stripeBinData.country);
+
+    const authenticity: AuthenticityReport = {
+      isValidLuhn: true,
+      issuer: binMeta.issuer,
+      cardType: binMeta.category,
+      region: binMeta.region,
+      binMetadata: {
+        brand: binMeta.brand,
+        level: binMeta.level,
+        category: binMeta.category,
+        country: binMeta.country,
+      },
+      securityChecks: {
+        cvvMatched: true,
+        expiryUnexpired: !isExpired,
+        formatCorrect: true,
+      },
+    };
+
+    // ----- STEP 2: Pre-verification risk gate -----
+    // If card is expired, reject immediately before charging
+    if (isExpired) {
+      return res.status(400).json({
+        error: "Card is expired. Payment blocked by risk screening.",
+        riskAssessment: { riskScore: 90, riskLevel: "critical", flags },
+      });
+    }
+
+    // ----- STEP 3: Create PaymentIntent with automatic capture -----
+    const chargeIdempKey = generateIdempotencyKey("charge");
+    const amountInCents = Math.round(amount * 100);
+
+    let avsChecks: AVSChecks = {
+      addressLine1: "unchecked",
+      postalCode: "unchecked",
+      cvcCheck: "unchecked",
+    };
+    let threeDSecureStatus: StripeChargeResult["threeDSecure"] = {
+      status: "not_required",
+    };
+
+    let paymentIntent: Stripe.PaymentIntent;
+    try {
+      paymentIntent = await stripeClient.paymentIntents.create(
+        {
+          amount: amountInCents,
+          currency: (currency || "usd").toLowerCase(),
+          payment_method: paymentMethodId,
+          capture_method: "automatic",
+          confirm: true,
+          description: description || "VerifyCORE payment",
+          receipt_email: receiptEmail || undefined,
+          metadata: {
+            source: "verifycore",
+            cardholderName: cardholderName || "N/A",
+            billingZip: billingZip || "N/A",
+          },
+          payment_method_options: {
+            card: {
+              request_three_d_secure: "automatic",
+            },
+          },
+          return_url: `http://localhost:${PORT}/?stripe_return=true`,
+        },
+        {
+          idempotencyKey: chargeIdempKey,
+        }
+      );
+    } catch (piErr: any) {
+      console.error("PaymentIntent creation failed:", piErr.message);
+
+      // Handle card declined
+      if (piErr.type === "StripeCardError") {
+        flags.push(`CARD_ERROR: ${piErr.decline_code || piErr.message}`);
+        return res.status(402).json({
+          error: `Payment declined: ${piErr.message}`,
+          declineCode: piErr.decline_code,
+          riskAssessment: { riskScore: 85, riskLevel: "critical", flags },
+        });
+      }
+
+      return res.status(500).json({
+        error: `Payment processing error: ${piErr.message}`,
+      });
+    }
+
+    // ----- Handle 3DS challenge -----
+    if (paymentIntent.status === "requires_action") {
+      threeDSecureStatus = {
+        status: "challenge_required",
+        clientSecret: paymentIntent.client_secret || undefined,
+      };
+
+      // Return early — frontend needs to handle 3DS then confirm
+      const preAuth: PreAuthResult = {
+        holdAmount: amount,
+        holdCurrency: (currency || "usd").toUpperCase(),
+        holdStatus: "placed",
+        voidConfirmed: false,
+        paymentIntentId: paymentIntent.id,
+        avsChecks,
+        idempotencyKey: chargeIdempKey,
+      };
+
+      return res.json({
+        success: false,
+        mode: "stripe",
+        paymentMethodId,
+        stripeBinData,
+        threeDSecure: threeDSecureStatus,
+        preAuth,
+        intelligence: { riskScore: 5, securitySummary: "3DS challenge required.", fundsAnalysis: { availableFunds: 0, creditLimit: 0, outstandingBalance: 0, utilizationRate: 0, recommendation: "PENDING_3DS", currency: "USD" }, recentTransactions: [], authenticityComment: "Awaiting 3D Secure authentication." },
+        authenticity,
+        riskAssessment: { riskScore: 5, riskLevel: "low" as const, flags },
+        payment: {
+          chargeId: paymentIntent.id,
+          amount,
+          currency: (currency || "usd").toUpperCase(),
+          status: "requires_action" as const,
+          receiptUrl: null,
+          description: description || "VerifyCORE payment",
+          cardBrand: stripeBinData.brand,
+          last4: stripeBinData.last4,
+          createdAt: new Date().toISOString(),
+        },
+      } satisfies StripeChargeResult);
+    }
+
+    // ----- Handle declined -----
+    if (paymentIntent.status === "requires_payment_method") {
+      const lastError = paymentIntent.last_payment_error;
+      flags.push(`DECLINED: ${lastError?.decline_code || lastError?.message || "unknown"}`);
+
+      return res.status(402).json({
+        error: `Payment declined: ${lastError?.message || "Card was declined"}`,
+        declineCode: lastError?.decline_code,
+        riskAssessment: { riskScore: 85, riskLevel: "critical", flags },
+      });
+    }
+
+    // ----- Payment succeeded -----
+    // Extract AVS/CVV from latest charge
+    const latestCharge = paymentIntent.latest_charge;
+    let receiptUrl: string | null = null;
+
+    if (latestCharge && typeof latestCharge !== "string") {
+      receiptUrl = latestCharge.receipt_url || null;
+      const cardChecks = latestCharge.payment_method_details?.card?.checks;
+      if (cardChecks) {
+        avsChecks = {
+          addressLine1: cardChecks.address_line1_check || "unavailable",
+          postalCode: cardChecks.address_postal_code_check || "unavailable",
+          cvcCheck: cardChecks.cvc_check || "unavailable",
+        };
+      }
+      const threeDSecureResult = latestCharge.payment_method_details?.card?.three_d_secure;
+      if (threeDSecureResult) {
+        threeDSecureStatus = {
+          status: threeDSecureResult.result === "authenticated" || threeDSecureResult.result === "attempt_acknowledged"
+            ? "succeeded" : threeDSecureResult.result === "failed" ? "failed" : "not_required",
+        };
+      }
+    } else if (typeof latestCharge === "string") {
+      try {
+        const charge = await stripeClient.charges.retrieve(latestCharge);
+        receiptUrl = charge.receipt_url || null;
+        const cardChecks = charge.payment_method_details?.card?.checks;
+        if (cardChecks) {
+          avsChecks = {
+            addressLine1: cardChecks.address_line1_check || "unavailable",
+            postalCode: cardChecks.address_postal_code_check || "unavailable",
+            cvcCheck: cardChecks.cvc_check || "unavailable",
+          };
+        }
+      } catch (chargeErr) {
+        console.error("Failed to retrieve charge:", chargeErr);
+      }
+    }
+
+    // Update security checks with real AVS/CVV
+    authenticity.securityChecks.cvvMatched = avsChecks.cvcCheck === "pass";
+    if (avsChecks.cvcCheck === "fail") flags.push("CVC_CHECK_FAILED");
+    if (avsChecks.postalCode === "fail") flags.push("AVS_POSTAL_CODE_MISMATCH");
+    if (avsChecks.addressLine1 === "fail") flags.push("AVS_ADDRESS_LINE_MISMATCH");
+
+    // Risk assessment
+    let riskScore = 5;
+    if (flags.some(f => f.startsWith("CVC_CHECK_FAILED"))) riskScore = Math.max(riskScore, 75);
+    if (flags.some(f => f.includes("PREPAID"))) riskScore = Math.max(riskScore, 30);
+    if (flags.some(f => f.includes("AVS_POSTAL"))) riskScore = Math.max(riskScore, 20);
+    if (flags.some(f => f.includes("AVS_ADDRESS"))) riskScore = Math.max(riskScore, 25);
+
+    let riskLevel: "low" | "medium" | "high" | "critical" = "low";
+    if (riskScore >= 75) riskLevel = "critical";
+    else if (riskScore >= 50) riskLevel = "high";
+    else if (riskScore >= 25) riskLevel = "medium";
+
+    // Build payment result
+    const payment: PaymentResult = {
+      chargeId: paymentIntent.id,
+      amount,
+      currency: (currency || "usd").toUpperCase(),
+      status: "succeeded",
+      receiptUrl,
+      description: description || "VerifyCORE payment",
+      cardBrand: stripeBinData.brand,
+      last4: stripeBinData.last4,
+      createdAt: new Date().toISOString(),
+    };
+
+    // Store transaction record
+    const txRecord: TransactionRecord = {
+      ...payment,
+      cardholderName: cardholderName || "N/A",
+      billingZip: billingZip || "N/A",
+      receiptEmail: receiptEmail || undefined,
+      riskScore,
+      verificationPassed: riskScore < 75,
+    };
+    addTransaction(txRecord);
+
+    const preAuth: PreAuthResult = {
+      holdAmount: amount,
+      holdCurrency: (currency || "usd").toUpperCase(),
+      holdStatus: "placed",
+      voidConfirmed: false,
+      paymentIntentId: paymentIntent.id,
+      avsChecks,
+      idempotencyKey: chargeIdempKey,
+    };
+
+    const chargeResult: StripeChargeResult = {
+      success: paymentIntent.status === "succeeded",
+      mode: "stripe",
+      paymentMethodId,
+      stripeBinData,
+      threeDSecure: threeDSecureStatus,
+      preAuth,
+      intelligence: {
+        riskScore,
+        securitySummary: `Payment of $${amount.toFixed(2)} ${paymentIntent.status === "succeeded" ? "captured successfully" : "failed"} via Stripe gateway. PCI-DSS Level 1 tokenization.`,
+        fundsAnalysis: {
+          availableFunds: 0,
+          creditLimit: 0,
+          outstandingBalance: 0,
+          utilizationRate: 0,
+          recommendation: paymentIntent.status === "succeeded" ? "PAYMENT_CAPTURED" : "PAYMENT_FAILED",
+          currency: (currency || "usd").toUpperCase(),
+        },
+        recentTransactions: [],
+        authenticityComment: `Stripe-verified ${binMeta.brand} card (****${stripeBinData.last4}) — $${amount.toFixed(2)} charged successfully.`,
+      },
+      authenticity,
+      riskAssessment: { riskScore, riskLevel, flags },
+      payment,
+    };
+
+    res.json(chargeResult);
+  } catch (err: any) {
+    console.error("Charge payment endpoint failure:", err);
+    res.status(500).json({
+      error: err.message || "An error occurred during payment processing.",
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// REFUND: Issue a full refund for a previous charge
+// ---------------------------------------------------------------------------
+app.post("/api/refund-payment", async (req, res) => {
+  try {
+    if (!stripeClient) {
+      return res.status(503).json({ error: "Stripe is not configured." });
+    }
+
+    const { paymentIntentId, reason } = req.body;
+    if (!paymentIntentId) {
+      return res.status(400).json({ error: "Missing paymentIntentId." });
+    }
+
+    const refundIdempKey = generateIdempotencyKey("refund");
+
+    const refund = await stripeClient.refunds.create(
+      {
+        payment_intent: paymentIntentId,
+        reason: reason === "duplicate" ? "duplicate" : reason === "fraudulent" ? "fraudulent" : "requested_by_customer",
+      },
+      { idempotencyKey: refundIdempKey }
+    );
+
+    // Update transaction store
+    const existingTx = transactionStore.get(paymentIntentId);
+    if (existingTx) {
+      existingTx.status = "refunded";
+      existingTx.refundedAt = new Date().toISOString();
+      existingTx.refundId = refund.id;
+      existingTx.refundAmount = (refund.amount || 0) / 100;
+      transactionStore.set(paymentIntentId, existingTx);
+    }
+
+    res.json({
+      success: true,
+      refundId: refund.id,
+      amount: (refund.amount || 0) / 100,
+      currency: (refund.currency || "usd").toUpperCase(),
+      status: refund.status,
+      paymentIntentId,
+    });
+  } catch (err: any) {
+    console.error("Refund endpoint failure:", err);
+    res.status(500).json({
+      error: err.message || "Refund failed.",
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TRANSACTIONS: Get recent transaction history
+// ---------------------------------------------------------------------------
+app.get("/api/transactions", (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+  const transactions = getTransactions(limit);
+  res.json({ transactions, total: transactionStore.size });
 });
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,12 @@ import {
   ShieldCheck,
   ShieldAlert,
   Ban,
+  DollarSign,
+  RotateCcw,
+  Receipt,
+  Clock,
+  Search,
+  ExternalLink,
 } from 'lucide-react';
 import { 
   EncryptedCardPayload, 
@@ -37,6 +43,9 @@ import {
   GeminiResponse, 
   VerificationResult,
   StripeVerificationResult,
+  StripeChargeResult,
+  TransactionRecord,
+  PaymentResult,
 } from './types';
 import StripeCardForm from './components/StripeCardForm';
 
@@ -100,6 +109,7 @@ const TEST_PROFILES = [
 ];
 
 type AppMode = 'simulator' | 'stripe';
+type StripeSubMode = 'verify' | 'charge';
 
 export default function App() {
   // Mode toggle
@@ -140,6 +150,14 @@ export default function App() {
   const [consoleLogs, setConsoleLogs] = useState<string[]>([]);
   const [verificationResult, setVerificationResult] = useState<VerificationResult | null>(null);
   const [stripeResult, setStripeResult] = useState<StripeVerificationResult | null>(null);
+  const [chargeResult, setChargeResult] = useState<StripeChargeResult | null>(null);
+
+  // Stripe sub-mode
+  const [stripeSubMode, setStripeSubMode] = useState<StripeSubMode>('verify');
+
+  // Transaction history
+  const [transactionHistory, setTransactionHistory] = useState<TransactionRecord[]>([]);
+  const [refundingId, setRefundingId] = useState<string | null>(null);
 
   // Fetch Stripe configuration
   useEffect(() => {
@@ -370,6 +388,154 @@ export default function App() {
   };
 
   // ---------------------------------------------------------------------------
+  // STRIPE MODE: Handle payment charge (verify first, then capture)
+  // ---------------------------------------------------------------------------
+  const handleStripeCharge = async (paymentMethodId: string, amount: number, description: string, receiptEmail: string) => {
+    setCurrentStep(0);
+    setPipelineMessages([]);
+    setVerificationResult(null);
+    setStripeResult(null);
+    setChargeResult(null);
+
+    const runStep = (stepIdx: number, message: string) => {
+      return new Promise<void>((resolve) => {
+        setTimeout(() => {
+          setCurrentStep(stepIdx);
+          setPipelineMessages(prev => [...prev, message]);
+          addLog(`⚡ Pipeline Step [${stepIdx + 1}/7]: ${message}`);
+          resolve();
+        }, 450);
+      });
+    };
+
+    await runStep(0, "PCI-DSS Stripe.js Tokenization Complete...");
+    await runStep(1, "Transmitting PaymentMethod token to secure backend...");
+    await runStep(2, "Retrieving BIN metadata & card fingerprint via Stripe API...");
+    await runStep(3, "Running pre-charge fraud screening & risk assessment...");
+    await runStep(4, `Creating PaymentIntent for $${amount.toFixed(2)} with automatic capture...`);
+
+    try {
+      const response = await fetch("/api/charge-payment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paymentMethodId,
+          amount,
+          currency: "usd",
+          description,
+          cardholderName: stripeCardholderName,
+          billingZip: stripeBillingZip,
+          receiptEmail: receiptEmail || undefined,
+        }),
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({ error: "Payment gateway returned error state." }));
+        throw new Error(errData.error || "Payment failed.");
+      }
+
+      const result: StripeChargeResult = await response.json();
+
+      // Handle 3DS challenge if required
+      if (result.threeDSecure.status === 'challenge_required' && result.threeDSecure.clientSecret && stripePromise) {
+        addLog('🔐 3D Secure challenge required — launching authentication modal...');
+        await runStep(5, "3D Secure 2.0 cardholder authentication challenge in progress...");
+
+        const stripe = await stripePromise;
+        if (stripe) {
+          const { error: threeDSError } = await stripe.handleNextAction({
+            clientSecret: result.threeDSecure.clientSecret,
+          });
+
+          if (threeDSError) {
+            addLog(`❌ 3DS Challenge Failed: ${threeDSError.message}`);
+            result.threeDSecure.status = 'failed';
+            result.success = false;
+            result.riskAssessment.flags.push('3DS_CHALLENGE_FAILED');
+          } else {
+            addLog('✅ 3D Secure authentication completed successfully.');
+            result.threeDSecure.status = 'succeeded';
+          }
+        }
+      } else {
+        await runStep(5, "AVS/CVV validation complete...");
+      }
+
+      await runStep(6, `Payment captured — $${amount.toFixed(2)} charged successfully.`);
+
+      setTimeout(() => {
+        setChargeResult(result);
+        setCurrentStep(8); // Final charge results state
+        setIsLoading(false);
+        if (result.success && result.payment) {
+          addLog(`💰 Payment Captured! $${result.payment.amount.toFixed(2)} charged to ${result.payment.cardBrand} ****${result.payment.last4}. ID: ${result.payment.chargeId}`);
+        } else {
+          addLog(`❌ Payment Failed. ${result.riskAssessment.flags.join(', ')}`);
+        }
+        fetchTransactions();
+      }, 400);
+    } catch (apiErr: any) {
+      addLog(`❌ Payment Error: ${apiErr.message}`);
+      setIsLoading(false);
+      setCurrentStep(-1);
+    }
+  };
+
+  // Fetch transaction history
+  const fetchTransactions = async () => {
+    try {
+      const response = await fetch("/api/transactions");
+      if (response.ok) {
+        const data = await response.json();
+        setTransactionHistory(data.transactions || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch transactions:", err);
+    }
+  };
+
+  // Refund a payment
+  const handleRefund = async (paymentIntentId: string) => {
+    setRefundingId(paymentIntentId);
+    addLog(`🔄 Initiating refund for PaymentIntent ${paymentIntentId}...`);
+
+    try {
+      const response = await fetch("/api/refund-payment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paymentIntentId, reason: "requested_by_customer" }),
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({ error: "Refund failed." }));
+        throw new Error(errData.error || "Refund failed.");
+      }
+
+      const result = await response.json();
+      addLog(`✅ Refund successful! $${result.amount.toFixed(2)} refunded. Refund ID: ${result.refundId}`);
+
+      // Update charge result if viewing it
+      if (chargeResult && chargeResult.payment.chargeId === paymentIntentId) {
+        setChargeResult({
+          ...chargeResult,
+          payment: { ...chargeResult.payment, status: 'refunded' },
+        });
+      }
+
+      fetchTransactions();
+    } catch (err: any) {
+      addLog(`❌ Refund Error: ${err.message}`);
+    } finally {
+      setRefundingId(null);
+    }
+  };
+
+  // Load transactions on mount
+  useEffect(() => {
+    fetchTransactions();
+  }, []);
+
+  // ---------------------------------------------------------------------------
   // SIMULATOR MODE: Original verification workflow
   // ---------------------------------------------------------------------------
   const executeVerificationWorkflow = async (e: React.FormEvent) => {
@@ -512,7 +678,8 @@ export default function App() {
   // Determine what result to show
   const hasSimulatorResult = currentStep === 5 && verificationResult;
   const hasStripeResult = currentStep === 7 && stripeResult;
-  const hasAnyResult = hasSimulatorResult || hasStripeResult;
+  const hasChargeResult = currentStep === 8 && chargeResult;
+  const hasAnyResult = hasSimulatorResult || hasStripeResult || hasChargeResult;
 
   // Pipeline steps differ by mode
   const simulatorPipelineSteps = [
@@ -532,8 +699,22 @@ export default function App() {
     { label: "Hold Void & Report Compilation", d: "Immediately cancels pre-auth hold and compiles comprehensive verification report." }
   ];
 
-  const pipelineSteps = appMode === 'stripe' ? stripePipelineSteps : simulatorPipelineSteps;
-  const finalStepIndex = appMode === 'stripe' ? 7 : 5;
+  const chargePipelineSteps = [
+    { label: "Stripe.js PCI-DSS Tokenization", d: "Card data collected via hosted iframes — raw PAN never touches JavaScript or server." },
+    { label: "Secure Token Transmission", d: "PaymentMethod ID (pm_xxx) sent to backend — no cardholder data in transit." },
+    { label: "BIN Metadata & Card Fingerprint", d: "Stripe API returns brand, funding type, country, and card fingerprint." },
+    { label: "Pre-Charge Fraud Screening", d: "Risk assessment and card validation before any funds are captured." },
+    { label: "PaymentIntent Creation", d: "Creates PaymentIntent with automatic capture for the specified amount." },
+    { label: "AVS/CVV Validation", d: "Address and CVC verification code matching on the live charge." },
+    { label: "Payment Capture Confirmation", d: "Funds captured from the card — payment is finalized." },
+  ];
+
+  const pipelineSteps = appMode === 'stripe'
+    ? (stripeSubMode === 'charge' ? chargePipelineSteps : stripePipelineSteps)
+    : simulatorPipelineSteps;
+  const finalStepIndex = appMode === 'stripe'
+    ? (stripeSubMode === 'charge' ? 8 : 7)
+    : 5;
 
   return (
     <div id="verify-core-main-viewport" className="min-h-screen bg-slate-900 text-slate-200 font-sans flex flex-col antialiased">
@@ -773,36 +954,80 @@ export default function App() {
               </div>
             )}
 
-            {/* STRIPE MODE: Stripe Card Form */}
+            {/* STRIPE MODE: Sub-mode tabs + Stripe Card Form */}
             {appMode === 'stripe' && stripePromise && (
-              <Elements stripe={stripePromise} options={{
-                appearance: {
-                  theme: 'night',
-                  variables: {
-                    colorPrimary: '#8b5cf6',
-                    colorBackground: '#0f172a',
-                    colorText: '#e2e8f0',
-                    colorDanger: '#ef4444',
-                    fontFamily: '"Plus Jakarta Sans", system-ui, sans-serif',
-                    borderRadius: '0px',
+              <>
+                {/* Verify / Charge sub-tabs */}
+                <div className="flex gap-2 mb-4">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStripeSubMode('verify');
+                      setCurrentStep(-1);
+                      setStripeResult(null);
+                      setChargeResult(null);
+                      addLog('🔍 Switched to Verify Only mode.');
+                    }}
+                    className={`flex-1 py-3 px-4 text-xs font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 border ${
+                      stripeSubMode === 'verify'
+                        ? 'bg-violet-950/50 border-violet-500 text-violet-300'
+                        : 'bg-slate-900/50 border-slate-700 text-slate-400 hover:bg-slate-800/50 hover:text-slate-300'
+                    }`}
+                  >
+                    <Search className="w-4 h-4" />
+                    <span>🔍 Verify Only</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStripeSubMode('charge');
+                      setCurrentStep(-1);
+                      setStripeResult(null);
+                      setChargeResult(null);
+                      addLog('💳 Switched to Charge Payment mode.');
+                    }}
+                    className={`flex-1 py-3 px-4 text-xs font-bold uppercase tracking-widest transition-all flex items-center justify-center gap-2 border ${
+                      stripeSubMode === 'charge'
+                        ? 'bg-amber-950/50 border-amber-500 text-amber-300'
+                        : 'bg-slate-900/50 border-slate-700 text-slate-400 hover:bg-slate-800/50 hover:text-slate-300'
+                    }`}
+                  >
+                    <DollarSign className="w-4 h-4" />
+                    <span>💳 Charge Payment</span>
+                  </button>
+                </div>
+
+                <Elements stripe={stripePromise} options={{
+                  appearance: {
+                    theme: 'night',
+                    variables: {
+                      colorPrimary: stripeSubMode === 'charge' ? '#d97706' : '#8b5cf6',
+                      colorBackground: '#0f172a',
+                      colorText: '#e2e8f0',
+                      colorDanger: '#ef4444',
+                      fontFamily: '"Plus Jakarta Sans", system-ui, sans-serif',
+                      borderRadius: '0px',
+                    },
                   },
-                },
-              }}>
-                <StripeCardForm
-                  onTokenized={handleStripeTokenized}
-                  onError={(error) => {
-                    addLog(`❌ ${error}`);
-                    setIsLoading(false);
-                  }}
-                  isLoading={isLoading}
-                  setIsLoading={setIsLoading}
-                  addLog={addLog}
-                  cardholderName={stripeCardholderName}
-                  onCardholderNameChange={setStripeCardholderName}
-                  billingZip={stripeBillingZip}
-                  onBillingZipChange={setStripeBillingZip}
-                />
+                }}>
+                  <StripeCardForm
+                    onTokenized={handleStripeTokenized}
+                    onChargeTokenized={handleStripeCharge}
+                    chargeMode={stripeSubMode === 'charge'}
+                    onError={(error) => {
+                      addLog(`❌ ${error}`);
+                      setIsLoading(false);
+                    }}
+                    isLoading={isLoading}
+                    setIsLoading={setIsLoading}
+                    addLog={addLog}
+                    cardholderName={stripeCardholderName}
+                    onCardholderNameChange={setStripeCardholderName}
+                    billingZip={stripeBillingZip}
+                    onBillingZipChange={setStripeBillingZip}
+                  />
               </Elements>
+              </>
             )}
 
             {/* Stripe not available notice */}
@@ -1659,6 +1884,233 @@ export default function App() {
                 </div>
               </div>
             ) : null}
+
+            {/* CHARGE RESULTS */}
+            {hasChargeResult && chargeResult ? (
+              <div className="space-y-6 animate-fadeIn">
+                
+                {/* Payment Success/Fail Banner */}
+                {chargeResult.success && chargeResult.payment.status === 'succeeded' ? (
+                  <div className={`border-2 p-6 rounded-none space-y-3 ${
+                    chargeResult.payment.status === 'refunded'
+                      ? 'bg-slate-900/50 border-slate-500'
+                      : 'bg-emerald-950/25 border-emerald-500'
+                  }`}>
+                    <div className="flex items-center gap-2.5 font-bold uppercase tracking-widest text-xs">
+                      {chargeResult.payment.status === 'refunded' ? (
+                        <><RotateCcw className="w-5 h-5 text-slate-400" /> <span className="text-slate-300">PAYMENT REFUNDED</span></>
+                      ) : (
+                        <><CheckCircle className="w-5 h-5 text-emerald-400" /> <span className="text-emerald-400">PAYMENT CAPTURED SUCCESSFULLY</span></>
+                      )}
+                    </div>
+                    <div className="flex items-baseline gap-3">
+                      <span className={`text-4xl font-bold font-mono tracking-tight ${
+                        chargeResult.payment.status === 'refunded' ? 'text-slate-400 line-through' : 'text-white'
+                      }`}>
+                        ${chargeResult.payment.amount.toFixed(2)}
+                      </span>
+                      <span className="text-sm text-slate-400 font-mono">{chargeResult.payment.currency}</span>
+                    </div>
+                    <p className="text-slate-400 text-xs">
+                      {chargeResult.intelligence.authenticityComment}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="bg-red-950/30 border-2 border-red-500 pulse-border-alert p-5 rounded-none space-y-2">
+                    <div className="flex items-center gap-2.5 text-red-400 font-bold uppercase tracking-widest text-xs">
+                      <XCircle className="w-5 h-5 text-red-500" />
+                      PAYMENT FAILED / DECLINED
+                    </div>
+                    <p className="text-slate-300 text-xs">
+                      {chargeResult.intelligence.authenticityComment}
+                    </p>
+                    {chargeResult.riskAssessment.flags.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 mt-2">
+                        {chargeResult.riskAssessment.flags.map((flag, i) => (
+                          <span key={i} className="text-[9px] font-mono bg-red-950 text-red-400 px-1.5 py-0.5 border border-red-500/30">
+                            {flag}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Payment Details Card */}
+                {chargeResult.payment && (
+                  <div className="bg-slate-900 border border-slate-800 p-5 space-y-4">
+                    <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                      <h4 className="text-xs uppercase tracking-widest text-amber-400 font-bold flex items-center gap-1.5">
+                        <Receipt className="w-4 h-4" /> Payment Receipt
+                      </h4>
+                      <span className={`text-[9px] font-mono font-bold px-2 py-0.5 uppercase ${
+                        chargeResult.payment.status === 'succeeded' ? 'bg-emerald-950 text-emerald-400' :
+                        chargeResult.payment.status === 'refunded' ? 'bg-slate-800 text-slate-400' :
+                        'bg-red-950 text-red-400'
+                      }`}>
+                        {chargeResult.payment.status === 'succeeded' ? '✓ CAPTURED' :
+                         chargeResult.payment.status === 'refunded' ? '↩ REFUNDED' :
+                         '✗ FAILED'}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-y-3 gap-x-4 text-xs font-mono">
+                      <div className="border-b border-slate-850 pb-1.5">
+                        <span className="text-slate-500 text-[10px] block uppercase">Amount</span>
+                        <span className="text-white mt-0.5 block text-lg font-bold">${chargeResult.payment.amount.toFixed(2)} {chargeResult.payment.currency}</span>
+                      </div>
+                      <div className="border-b border-slate-850 pb-1.5">
+                        <span className="text-slate-500 text-[10px] block uppercase">Card</span>
+                        <span className="text-slate-200 mt-0.5 block capitalize">{chargeResult.payment.cardBrand} ****{chargeResult.payment.last4}</span>
+                      </div>
+                      <div className="border-b border-slate-850 pb-1.5">
+                        <span className="text-slate-500 text-[10px] block uppercase">Payment ID</span>
+                        <span className="text-slate-300 mt-0.5 block text-[10px] truncate">{chargeResult.payment.chargeId}</span>
+                      </div>
+                      <div className="border-b border-slate-850 pb-1.5">
+                        <span className="text-slate-500 text-[10px] block uppercase">Timestamp</span>
+                        <span className="text-slate-300 mt-0.5 block text-[10px]">{new Date(chargeResult.payment.createdAt).toLocaleString()}</span>
+                      </div>
+                      {chargeResult.payment.description && (
+                        <div className="border-b border-slate-850 pb-1.5 col-span-2">
+                          <span className="text-slate-500 text-[10px] block uppercase">Description</span>
+                          <span className="text-slate-200 mt-0.5 block">{chargeResult.payment.description}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Receipt URL + Refund */}
+                    <div className="flex gap-3 pt-2">
+                      {chargeResult.payment.receiptUrl && (
+                        <a
+                          href={chargeResult.payment.receiptUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex-1 py-2.5 px-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-center gap-2 transition-colors"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" /> View Stripe Receipt
+                        </a>
+                      )}
+                      {chargeResult.payment.status === 'succeeded' && (
+                        <button
+                          type="button"
+                          onClick={() => handleRefund(chargeResult.payment.chargeId)}
+                          disabled={refundingId === chargeResult.payment.chargeId}
+                          className="flex-1 py-2.5 px-4 bg-red-950/50 hover:bg-red-900/50 border border-red-500/30 text-xs font-bold uppercase tracking-wider text-red-400 flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
+                        >
+                          {refundingId === chargeResult.payment.chargeId ? (
+                            <><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Processing...</>
+                          ) : (
+                            <><RotateCcw className="w-3.5 h-3.5" /> Refund Payment</>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Risk Assessment */}
+                <div className="bg-slate-900 border border-slate-800 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs uppercase tracking-wider text-amber-400 font-bold flex items-center gap-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5" /> Risk Assessment
+                    </span>
+                    <span className={`text-[9px] font-mono font-bold px-2 py-0.5 uppercase ${
+                      chargeResult.riskAssessment.riskLevel === 'low' ? 'bg-emerald-950 text-emerald-400' :
+                      chargeResult.riskAssessment.riskLevel === 'medium' ? 'bg-amber-950 text-amber-400' :
+                      'bg-red-950 text-red-400'
+                    }`}>
+                      {chargeResult.riskAssessment.riskLevel.toUpperCase()} — {chargeResult.riskAssessment.riskScore}%
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    {[
+                      { label: 'CVC Check', value: chargeResult.preAuth.avsChecks.cvcCheck },
+                      { label: 'Postal Code', value: chargeResult.preAuth.avsChecks.postalCode },
+                      { label: 'Address Line', value: chargeResult.preAuth.avsChecks.addressLine1 },
+                    ].map((check) => (
+                      <div key={check.label} className={`p-2.5 border text-center ${
+                        check.value === 'pass' ? 'border-emerald-500/30 bg-emerald-950/20' :
+                        check.value === 'fail' ? 'border-red-500/30 bg-red-950/20' :
+                        'border-slate-700/30 bg-slate-950/20'
+                      }`}>
+                        <div className="text-[9px] uppercase text-slate-500 font-bold">{check.label}</div>
+                        <div className={`text-xs font-bold font-mono mt-1 ${
+                          check.value === 'pass' ? 'text-emerald-400' :
+                          check.value === 'fail' ? 'text-red-400' :
+                          'text-slate-400'
+                        }`}>
+                          {check.value === 'pass' ? '✓ MATCH' :
+                           check.value === 'fail' ? '✗ FAIL' :
+                           check.value === 'unavailable' ? '— N/A' :
+                           '○ UNCHECKED'}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* BIN Data */}
+                <div className="bg-slate-900 border border-slate-800 p-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs uppercase tracking-wider text-amber-400 font-bold flex items-center gap-1.5">
+                      <Database className="w-3.5 h-3.5" /> Card Details
+                    </span>
+                    <span className="text-[9px] text-slate-500 font-mono capitalize">{chargeResult.stripeBinData.brand} • {chargeResult.stripeBinData.funding} • {chargeResult.stripeBinData.country}</span>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {/* TRANSACTION HISTORY */}
+            {appMode === 'stripe' && stripeSubMode === 'charge' && transactionHistory.length > 0 && (
+              <div className="bg-slate-900 border border-slate-800 p-5 space-y-4">
+                <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+                  <h4 className="text-xs uppercase tracking-widest text-amber-400 font-bold flex items-center gap-1.5">
+                    <Clock className="w-4 h-4" /> Transaction History
+                  </h4>
+                  <span className="text-[9px] text-slate-500 font-mono">{transactionHistory.length} records</span>
+                </div>
+                <div className="space-y-2 max-h-64 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-800">
+                  {transactionHistory.map((tx) => (
+                    <div key={tx.chargeId} className="p-3 bg-slate-950 border border-slate-900 flex justify-between items-center text-xs">
+                      <div className="space-y-1 min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className={`font-bold ${tx.status === 'refunded' ? 'text-slate-400 line-through' : 'text-white'}`}>
+                            ${tx.amount.toFixed(2)}
+                          </span>
+                          <span className="text-slate-500 capitalize">{tx.cardBrand} ****{tx.last4}</span>
+                        </div>
+                        <div className="flex gap-2 text-[10px] text-slate-500 truncate">
+                          <span>{tx.description || 'No description'}</span>
+                          <span>•</span>
+                          <span>{new Date(tx.createdAt).toLocaleString()}</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 ml-2 flex-shrink-0">
+                        <span className={`text-[9px] font-mono font-bold uppercase rounded px-1.5 py-0.5 ${
+                          tx.status === 'succeeded' ? 'bg-emerald-950 text-emerald-400' :
+                          tx.status === 'refunded' ? 'bg-slate-800 text-slate-400' :
+                          'bg-red-950 text-red-400'
+                        }`}>
+                          {tx.status === 'succeeded' ? '✓ PAID' : tx.status === 'refunded' ? '↩ REFUNDED' : tx.status}
+                        </span>
+                        {tx.status === 'succeeded' && (
+                          <button
+                            type="button"
+                            onClick={() => handleRefund(tx.chargeId)}
+                            disabled={refundingId === tx.chargeId}
+                            className="text-[9px] font-mono text-red-400 hover:text-red-300 underline disabled:opacity-50"
+                          >
+                            {refundingId === tx.chargeId ? '...' : 'Refund'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Awaiting state - no results yet */}
             {!hasAnyResult && (
